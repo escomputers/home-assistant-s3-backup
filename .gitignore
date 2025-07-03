@@ -1,0 +1,5 @@
+files/*
+secrets/*
+*.log
+mypy.ini
+.env
