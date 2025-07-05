@@ -33,6 +33,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from collections import Counter
 from typing import cast
 
@@ -40,6 +41,7 @@ import boto3
 import botocore
 import botocore.exceptions
 import paramiko
+import requests
 from dotenv import load_dotenv
 from iam_rolesanywhere_session import IAMRolesAnywhereSession
 from scp import SCPClient, SCPException
@@ -76,8 +78,11 @@ if SSH_PASS and SSH_KEY_PATH:
 if not (S3_BUCKET_NAME := os.getenv("S3_BUCKET_NAME")):
     raise ValueError("No 'S3_BUCKET_NAME' set in .env file")
 
-if not (S3_DIR := os.getenv("S3_BUCKET_NAME")):
+if not (S3_DIR := os.getenv("S3_DIR")):
     raise ValueError("No 'S3_DIR' set in .env file")
+
+# HOMEASSISTANT WEBHOOK URL
+HA_WEBHOOK_URL = os.getenv("HA_WEBHOOK_URL")
 
 # FILES
 
@@ -99,13 +104,37 @@ if not (UPLOAD_HISTORY_FILENAME := os.getenv("UPLOAD_HISTORY_FILENAME")):
 
 UPLOAD_HISTORY_FILE_PATH = os.path.join(LOCAL_DIR, UPLOAD_HISTORY_FILENAME)
 ##########################################################################
-
 # Logger configuration
 logging.basicConfig(
     filename=os.path.join(LOCAL_DIR, LOG_FILENAME),
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
+
+
+def notify_homeassistant(error_content: str) -> None:
+    """
+    Send a webhook notification to Home Assistant if an error was detected in the logs.
+    """
+    if not HA_WEBHOOK_URL:
+        logging.warning(
+            "No Home Assistant Webhook URL set, cannot send notification for errors"
+        )
+        sys.exit(1)
+
+    time.sleep(4)  # wait a few seconds to let logger write to the file
+
+    try:
+        requests.post(
+            HA_WEBHOOK_URL,
+            json={"message": f"Upload to S3 failed: {error_content}"},
+            timeout=5,
+        )
+        logging.warning("Error detected in log; webhook notification sent")
+    except requests.exceptions.RequestException as e:
+        logging.error("Failed to send webhook notification: %s", str(e))
+    finally:
+        sys.exit(1)
 
 
 def get_files_to_upload(
@@ -215,14 +244,16 @@ class SSHManager:
             )
             return client
         except paramiko.AuthenticationException as e:
-            logging.error("Error while connecting to SSH host: %s", str(e))
-            raise e
+            error_msg = f"Error while connecting to SSH host: {str(e)}"
+            logging.error(error_msg)
+            notify_homeassistant(error_msg)
 
     def download_remote_files(
         self, remote_file_path: str, local_file_path: str
     ) -> None:
         """
         Download a remote file over SCP and save it locally.
+        It will raise an error even though a single download fails.
 
         Args:
             remote_file_path (str): full path to the remote file
@@ -231,18 +262,21 @@ class SSHManager:
 
         transport = self.ssh_client.get_transport()
         if transport is None:
-            raise RuntimeError(
+            ssh_transport_error_msg = (
                 "SSH transport is not available (SSH connection might be closed)"
             )
+            logging.error(ssh_transport_error_msg)
+            notify_homeassistant(ssh_transport_error_msg)
 
         with SCPClient(transport) as scp:
             try:
                 scp.get(remote_file_path, local_file_path, preserve_times=True)
                 logging.info("Downloaded remote file on: '%s'", local_file_path)
             except SCPException as exc:
-                logging.error(
-                    "SCP protocol error for %s: %s", remote_file_path, str(exc)
-                )
+                scp_error_msg = f"SCP protocol error for{remote_file_path}:{str(exc)}"
+                logging.error(scp_error_msg)
+                notify_homeassistant(scp_error_msg)
+                raise
 
     def validate_sha256(self, sha256_digest: int) -> None:
         """
@@ -257,7 +291,7 @@ class SSHManager:
         invalid_digest_error_msg = "Invalid SHA-256 length returned by host"
         if sha256_digest != 64:
             logging.error(invalid_digest_error_msg)
-            raise ValueError(invalid_digest_error_msg)
+            notify_homeassistant(invalid_digest_error_msg)
 
     def calc_sha256(self, paths: list[str]) -> dict[str, str]:
         """
@@ -284,7 +318,7 @@ class SSHManager:
             remote_sha256sum_error_msg = f"Remote sha256sum error: {err}"
             if err:
                 logging.error(remote_sha256sum_error_msg)
-                raise RuntimeError(remote_sha256sum_error_msg)
+                notify_homeassistant(remote_sha256sum_error_msg)
 
             output = stdout.read().decode().strip().split()
 
@@ -314,7 +348,7 @@ class SSHManager:
         remote_error_msg = f"Error while listing remote files: {err}"
         if err:
             logging.error(remote_error_msg)
-            raise RuntimeError(remote_error_msg)
+            notify_homeassistant(remote_error_msg)
 
         files = stdout.read().decode().strip().splitlines()
 
@@ -372,10 +406,9 @@ class AWSManager:
         }
 
         if not all(creds.values()):
-            logging.error(
-                "Missing one or more IAM Roles Anywhere env variables: %s",
-                [k for k, v in creds.items() if not v],
-            )
+            iam_role_creds_error = f"Missing IAM Roles Anywhere env variables: {[k for k, v in creds.items() if not v]}"
+            logging.error(iam_role_creds_error)
+            notify_homeassistant(iam_role_creds_error)
             sys.exit()
 
         # Safe to cast: all values checked as non-None above
@@ -400,10 +433,18 @@ class AWSManager:
                 region=aws_creds["region"],
             ).get_session()
         except FileNotFoundError as e:
-            logging.error("Certificate or private key file not found: %s", e)
+            file_not_found_error_msg = (
+                f"Certificate or private key file not found: {str(e)}"
+            )
+            logging.error(file_not_found_error_msg)
+            notify_homeassistant(file_not_found_error_msg)
             raise
         except botocore.exceptions.ClientError as e:
-            logging.error("AWS client error during IAM Roles Anywhere auth: %s", e)
+            aws_client_error_msg = (
+                f"AWS client error during IAM Roles Anywhere auth: {str(e)}"
+            )
+            logging.error(aws_client_error_msg)
+            notify_homeassistant(aws_client_error_msg)
             raise
         return roles_anywhere_session.client("s3")
 
@@ -458,7 +499,9 @@ class AWSManager:
             return keys
 
         except botocore.exceptions.ClientError as exc:
-            logging.error("Error listing S3 files: %s", exc)
+            listing_s3_files_error_msg = f"Error listing S3 files: {str(exc)}"
+            logging.error(listing_s3_files_error_msg)
+            notify_homeassistant(listing_s3_files_error_msg)
             raise
 
     def verify_sha256(self, s3_file_path: str, sha_to_compare: str) -> None:
@@ -491,11 +534,11 @@ class AWSManager:
         # Compare the computed hash with the expected one of the remote file
         if s3_file_sha != sha_to_compare:
             remote_path = os.path.dirname(REMOTE_DIR) + os.path.basename(s3_file_path)
-            download_error_msg = (
+            sha_comparison_error_msg = (
                 f"{s3_file_path}:{s3_file_sha} != {remote_path}:{sha_to_compare}"
             )
-            logging.error(download_error_msg)
-            raise SystemError
+            logging.error(sha_comparison_error_msg)
+            notify_homeassistant(sha_comparison_error_msg)
 
         logging.info("Upload verified for file: %s", s3_file_path)
 
@@ -534,7 +577,9 @@ class AWSManager:
             try:
                 self.s3_client.upload_file(local_path, S3_BUCKET_NAME, s3_key)
             except botocore.exceptions.ClientError as exc:
-                logging.error("Error uploading: %s", str(exc))
+                upload_error_msg = f"Error uploading:{str(exc)}"
+                logging.error(upload_error_msg)
+                notify_homeassistant(upload_error_msg)
                 raise
 
             logging.info("Uploaded to s3://%s/%s", S3_BUCKET_NAME, s3_key)
@@ -552,78 +597,73 @@ class AWSManager:
         update_or_create_upload_history_file(upload_history_file)
 
 
-if __name__ == "__main__":
-    # Init SSH Manager class
-    ssh_manager = SSHManager()
+# Init SSH Manager class
+ssh_manager = SSHManager()
 
-    # List remote files
-    remote_files_details = ssh_manager.list_remote_files()
+# List remote files
+remote_files_details = ssh_manager.list_remote_files()
 
-    # Init SSH Manager class
-    aws_manager = AWSManager()
+# Init SSH Manager class
+aws_manager = AWSManager()
 
-    # If upload history file does not exist
-    # we have first run case or upload history file got deleted
-    if not os.path.exists(UPLOAD_HISTORY_FILE_PATH):
-        # Check if there are files on S3
-        # If so:
-        if s3_files_list := aws_manager.list_s3_files():
-            # Create a list of remote filenames
-            remote_files_list = [
-                os.path.basename(fn) for fn in list(remote_files_details.keys())
-            ]
+# If upload history file does not exist
+# we have first run case or upload history file got deleted
+if not os.path.exists(UPLOAD_HISTORY_FILE_PATH):
+    # Check if there are files on S3
+    # If so:
+    if s3_files_list := aws_manager.list_s3_files():
+        # Create a list of remote filenames
+        remote_files_list = [
+            os.path.basename(fn) for fn in list(remote_files_details.keys())
+        ]
 
-            # Nothing to do, 2 lists are identical
-            if Counter(s3_files_list) == Counter(remote_files_list):
-                logging.info("Same files both on source and destination")
+        # Nothing to do, 2 lists are identical
+        if Counter(s3_files_list) == Counter(remote_files_list):
+            logging.info("Same files both on source and destination")
 
-                # Re-create upload history file
-                upload_history_file_content = {
-                    f"{S3_DIR}/{fname}": remote_files_details[
-                        f"{os.path.dirname(REMOTE_DIR)}/{fname}"
-                    ]
-                    for fname in s3_files_list
-                }
+            # Re-create upload history file
+            upload_history_file_content = {
+                f"{S3_DIR}/{fname}": remote_files_details[
+                    f"{os.path.dirname(REMOTE_DIR)}/{fname}"
+                ]
+                for fname in s3_files_list
+            }
 
-                logging.info("Re-created local upload history file")
-                update_or_create_upload_history_file(upload_history_file_content)
+            logging.info("Re-created local upload history file")
+            update_or_create_upload_history_file(upload_history_file_content)
 
-            # Lists are not the same
-            # So get only the files on remote SSH host that are NOT in S3 files list
-            else:
-                missing = {
-                    path: sha
-                    for path, sha in remote_files_details.items()
-                    if os.path.basename(path) not in s3_files_list
-                }
+        # Lists are not the same
+        # So get only the files on remote SSH host that are NOT in S3 files list
+        else:
+            missing = {
+                path: sha
+                for path, sha in remote_files_details.items()
+                if os.path.basename(path) not in s3_files_list
+            }
 
-                # Re-create upload history file
-                upload_history_file_content = {
-                    f"{S3_DIR}/{os.path.basename(fn)}": sha
-                    for fn, sha in remote_files_details.items()
-                }
+            # Re-create upload history file
+            upload_history_file_content = {
+                f"{S3_DIR}/{os.path.basename(fn)}": sha
+                for fn, sha in remote_files_details.items()
+            }
 
-                aws_manager.upload_to_s3(
-                    missing, ssh_manager, upload_history_file_content
-                )
+            aws_manager.upload_to_s3(missing, ssh_manager, upload_history_file_content)
 
-        # No S3 files found case:
-        # download all files from SSH device on a temp directory
-        # and then upload to S3
-        aws_manager.upload_to_s3(remote_files_details, ssh_manager)
-
-    # Case where upload history file exists locally
-    # Read upload history file content
-    with open(UPLOAD_HISTORY_FILE_PATH, "r", encoding="utf-8") as upload_file_r:
-        upload_history_file_content = json.load(upload_file_r)
-
-    # Get a dictionary of the files to upload
-    missing_files_on_s3 = get_files_to_upload(
-        remote_files_details, upload_history_file_content
-    )
-
-    # Download missing files from SSH device on a temp directory
+    # No S3 files found case:
+    # download all files from SSH device on a temp directory
     # and then upload to S3
-    aws_manager.upload_to_s3(
-        missing_files_on_s3, ssh_manager, upload_history_file_content
-    )
+    aws_manager.upload_to_s3(remote_files_details, ssh_manager)
+
+# Case where upload history file exists locally
+# Read upload history file content
+with open(UPLOAD_HISTORY_FILE_PATH, "r", encoding="utf-8") as upload_file_r:
+    upload_history_file_content = json.load(upload_file_r)
+
+# Get a dictionary of the files to upload
+missing_files_on_s3 = get_files_to_upload(
+    remote_files_details, upload_history_file_content
+)
+
+# Download missing files from SSH device on a temp directory
+# and then upload to S3
+aws_manager.upload_to_s3(missing_files_on_s3, ssh_manager, upload_history_file_content)

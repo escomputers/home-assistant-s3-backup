@@ -3,3 +3,4 @@ secrets/*
 *.log
 mypy.ini
 .env
+*.lock.json

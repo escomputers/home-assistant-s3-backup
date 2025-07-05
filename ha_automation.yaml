@@ -1,0 +1,19 @@
+alias: Webhook Trigger
+description: ""
+triggers:
+  - trigger: webhook
+    allowed_methods:
+      - POST
+      - PUT
+    local_only: true
+    webhook_id: "REDACTED_WEBHOOK_ID"  # e.g. -hZuAOOiZBVd76Y2EVR80e0S
+conditions: []
+# Example send email through gmail or 
+# whatever you want, telegram/slack, phone notification etc.
+actions:
+  - action: notify.gmail
+    metadata: {}
+    data:
+      title: Errors on Home Assistant Backup to S3!
+      message: "{{ trigger.json.message }}"
+mode: single

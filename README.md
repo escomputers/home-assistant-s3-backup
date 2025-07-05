@@ -6,12 +6,12 @@ Useful for automating the backup of Home Assistant or other IoT systems to AWS S
 
 ### Requirements
 - Python 3.10+
-- An existing S3 bucket
-- An AWS identity with permission to:
+- an existing S3 bucket
+- an AWS identity with permission to:
   - `s3:ListBucket`
   - `s3:GetObject`
   - `s3:PutObject`
-- The `sha256sum` utility must be available on the remote SSH host
+- the `sha256sum` utility must be available on the remote SSH host
 
 ### Configuration
 Create a `.env` file in the root of the project by copying the provided `.env.example`:
@@ -23,7 +23,7 @@ Then you must set:
 - SSH access details (user, host, port, private key or password)
 - Remote source directory and file extension to match
 - S3 bucket and destination path
-- AWS credentials or IAM Roles Anywhere config
+- IAM Roles Anywhere config (optional)
 
 Credentials can be provided in two ways:
 - Using the default AWS profile on your local system (e.g., ~/.aws/credentials)
@@ -45,29 +45,16 @@ pip install -r requirements.txt
 python upload_to_s3.py
 ```
 
-The script will:
-1. Connect to the remote SSH host
-
-2. List all matching files in the specified directory
-
-3. Compute SHA256 checksums for each file
-
-4. Check which files haven't been uploaded to S3 yet
-
-5. Download missing files via SCP
-
-6. Upload them to S3
-
-7. Verify the uploaded file matches the original checksum
-
-8. Update a local JSON-based upload history
-
-### Upload history
 To avoid re-uploading the same files, the script tracks uploaded filenames and their hashes in a local JSON file (e.g., upload_history.lock.json).
 If this file is missing, the script compares remote files against what already exists in S3 to reconstruct the state.
 
-### Logging
-Logs are written to the file specified by LOG_FILENAME in the .env file.
+### Error handling and notification
+- All operational events and errors are logged to the file defined by `LOG_FILENAME` in your .env file.
+
+- If a fatal error occurs (e.g., SSH connection failure, file upload error, SHA256 mismatch), the script logs it and optionally sends a notification to Home Assistant via a webhook.\
+To enable notifications:
+  1. create an automation as shown in the file [ha_automation.yaml](ha_automation.yaml)
+  2. set HA_WEBHOOK_URL in your .env file
 
 ### Security Tips
 Never commit your .env file to Git.

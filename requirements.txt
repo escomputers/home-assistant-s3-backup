@@ -1,5 +1,6 @@
 boto3==1.38.46
 iam_rolesanywhere_session==2.3.0
 paramiko==3.5.1
+requests==2.32.4
 scp==0.15.0
 python-dotenv==1.1.1
