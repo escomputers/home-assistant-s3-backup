@@ -31,11 +31,12 @@ import json
 import logging
 import os
 import shutil
+import shlex
 import sys
 import tempfile
 import time
 from collections import Counter
-from typing import cast
+from typing import NoReturn, cast
 
 import boto3
 import botocore
@@ -112,7 +113,7 @@ logging.basicConfig(
 )
 
 
-def notify_homeassistant(error_content: str) -> None:
+def notify_homeassistant(error_content: str) -> NoReturn:
     """
     Send a webhook notification to Home Assistant if an error was detected in the logs.
     """
@@ -229,11 +230,10 @@ class SSHManager:
             paramiko.SSHClient: a connected SSH client instance.
         """
 
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
         try:
-            client = paramiko.SSHClient()
-
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
             client.connect(
                 SSH_HOST,
                 password=SSH_PASS,
@@ -243,10 +243,40 @@ class SSHManager:
                 timeout=10,
             )
             return client
-        except paramiko.AuthenticationException as e:
+        except (paramiko.SSHException, OSError) as e:
             error_msg = f"Error while connecting to SSH host: {str(e)}"
             logging.error(error_msg)
             notify_homeassistant(error_msg)
+
+    def exec_remote_command(self, cmd: str, error_context: str) -> tuple[str, str]:
+        """
+        Execute a command on the remote host and return decoded stdout/stderr.
+
+        Args:
+            cmd (str): shell command to execute on the remote SSH host
+            error_context (str): context to include in error logs/notifications
+
+        Returns:
+            tuple[str, str]: decoded stdout and stderr content
+        """
+        try:
+            _, stdout, stderr = self.ssh_client.exec_command(cmd)
+            return stdout.read().decode().strip(), stderr.read().decode().strip()
+        except (paramiko.SSHException, OSError) as exc:
+            error_msg = f"{error_context}: {str(exc)}"
+            logging.error(error_msg)
+            notify_homeassistant(error_msg)
+
+    @staticmethod
+    def remote_files_glob() -> str:
+        """
+        Build a shell-safe glob for the configured remote backup files.
+
+        The wildcard remains unquoted so the remote shell can expand it; the
+        configured directory and extension are quoted to avoid command injection.
+        """
+        source_dir = os.path.dirname(REMOTE_DIR).rstrip("/")
+        return f"{shlex.quote(source_dir + '/')}*{shlex.quote(BACKUP_FILES_EXT)}"
 
     def download_remote_files(
         self, remote_file_path: str, local_file_path: str
@@ -272,11 +302,10 @@ class SSHManager:
             try:
                 scp.get(remote_file_path, local_file_path, preserve_times=True)
                 logging.info("Downloaded remote file on: '%s'", local_file_path)
-            except SCPException as exc:
-                scp_error_msg = f"SCP protocol error for{remote_file_path}:{str(exc)}"
+            except (SCPException, OSError) as exc:
+                scp_error_msg = f"SCP error for {remote_file_path}: {str(exc)}"
                 logging.error(scp_error_msg)
                 notify_homeassistant(scp_error_msg)
-                raise
 
     def validate_sha256(self, sha256_digest: int) -> None:
         """
@@ -310,23 +339,29 @@ class SSHManager:
         digest_dict: dict[str, str] = {}
 
         for file in paths:
-            cmd = f"sha256sum {file}"
+            cmd = f"sha256sum {shlex.quote(file)}"
 
-            _, stdout, stderr = self.ssh_client.exec_command(cmd)
-
-            err = stderr.read().decode().strip()
-            remote_sha256sum_error_msg = f"Remote sha256sum error: {err}"
+            output, err = self.exec_remote_command(
+                cmd, f"Error while calculating SHA256 for {file}"
+            )
+            remote_sha256sum_error_msg = f"Remote sha256sum error for {file}: {err}"
             if err:
                 logging.error(remote_sha256sum_error_msg)
                 notify_homeassistant(remote_sha256sum_error_msg)
 
-            output = stdout.read().decode().strip().split()
+            output_parts = output.split(None, 1)
+            if not output_parts:
+                empty_sha256sum_error_msg = (
+                    f"Remote sha256sum returned no output for {file}"
+                )
+                logging.error(empty_sha256sum_error_msg)
+                notify_homeassistant(empty_sha256sum_error_msg)
 
-            digest, path = output
+            digest = output_parts[0]
 
             self.validate_sha256(len(digest))
 
-            digest_dict[path] = digest.lower()
+            digest_dict[file] = digest.lower()
 
         logging.info("Calculated and validated SHA256 of remote files: %s", digest_dict)
         return digest_dict
@@ -339,18 +374,15 @@ class SSHManager:
             dict[str, str]: mapping of remote file paths to their SHA256 checksums
         """
 
-        cmd = f"ls {REMOTE_DIR}"
+        cmd = f"ls -1 {self.remote_files_glob()}"
 
-        _, stdout, stderr = self.ssh_client.exec_command(cmd)
-
-        err = stderr.read().decode().strip()
-
+        output, err = self.exec_remote_command(cmd, "Error while listing remote files")
         remote_error_msg = f"Error while listing remote files: {err}"
         if err:
             logging.error(remote_error_msg)
             notify_homeassistant(remote_error_msg)
 
-        files = stdout.read().decode().strip().splitlines()
+        files = output.splitlines()
 
         no_remote_files_error_msg = "Cannot find any remote files"
         if not files:
@@ -438,14 +470,15 @@ class AWSManager:
             )
             logging.error(file_not_found_error_msg)
             notify_homeassistant(file_not_found_error_msg)
-            raise
-        except botocore.exceptions.ClientError as e:
+        except (
+            botocore.exceptions.ClientError,
+            botocore.exceptions.BotoCoreError,
+        ) as e:
             aws_client_error_msg = (
                 f"AWS client error during IAM Roles Anywhere auth: {str(e)}"
             )
             logging.error(aws_client_error_msg)
             notify_homeassistant(aws_client_error_msg)
-            raise
         return roles_anywhere_session.client("s3")
 
     def aws_auth(self) -> boto3.client:
@@ -463,8 +496,21 @@ class AWSManager:
             session.client("sts").get_caller_identity()
 
             client = session.client("s3")
-        except botocore.exceptions.NoCredentialsError:
+        except (
+            botocore.exceptions.NoCredentialsError,
+            botocore.exceptions.PartialCredentialsError,
+        ):
             client = self._iam_role_anywhere_auth()
+        except botocore.exceptions.ClientError as exc:
+            aws_auth_error_msg = (
+                f"AWS default credentials failed validation: {str(exc)}"
+            )
+            logging.error(aws_auth_error_msg)
+            notify_homeassistant(aws_auth_error_msg)
+        except botocore.exceptions.BotoCoreError as exc:
+            aws_auth_error_msg = f"AWS authentication error: {str(exc)}"
+            logging.error(aws_auth_error_msg)
+            notify_homeassistant(aws_auth_error_msg)
 
         return client
 
@@ -498,11 +544,13 @@ class AWSManager:
             logging.info("Found existing files in S3: %s", keys)
             return keys
 
-        except botocore.exceptions.ClientError as exc:
+        except (
+            botocore.exceptions.ClientError,
+            botocore.exceptions.BotoCoreError,
+        ) as exc:
             listing_s3_files_error_msg = f"Error listing S3 files: {str(exc)}"
             logging.error(listing_s3_files_error_msg)
             notify_homeassistant(listing_s3_files_error_msg)
-            raise
 
     def verify_sha256(self, s3_file_path: str, sha_to_compare: str) -> None:
         """
@@ -515,18 +563,27 @@ class AWSManager:
         Raises:
             SystemError: If the hash does not match.
         """
-        # Retrieve the object from the S3 bucket
-        obj = self.s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_file_path)
+        try:
+            # Retrieve the object from the S3 bucket
+            obj = self.s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_file_path)
 
-        # Initialize the SHA256 hasher
-        hasher = hashlib.sha256()
+            # Initialize the SHA256 hasher
+            hasher = hashlib.sha256()
 
-        # Get the object's binary stream body
-        body = obj["Body"]
+            # Get the object's binary stream body
+            body = obj["Body"]
 
-        # Stream the file in chunks and update the hash progressively
-        for chunk in body.iter_chunks():
-            hasher.update(chunk)
+            # Stream the file in chunks and update the hash progressively
+            for chunk in body.iter_chunks():
+                hasher.update(chunk)
+        except (
+            botocore.exceptions.ClientError,
+            botocore.exceptions.BotoCoreError,
+            OSError,
+        ) as exc:
+            verify_s3_error_msg = f"Error verifying S3 file {s3_file_path}: {str(exc)}"
+            logging.error(verify_s3_error_msg)
+            notify_homeassistant(verify_s3_error_msg)
 
         # Compute the final SHA256 hex digest
         s3_file_sha = hasher.hexdigest()
@@ -565,33 +622,37 @@ class AWSManager:
         if not upload_history_file:
             upload_history_file = {}
 
-        for remote_path, remote_sha in files_to_upload_to_s3.items():
-            fname = os.path.basename(remote_path)
-            local_path = os.path.join(tmpdir, fname)
-            s3_key = f"{S3_DIR}/{fname}"
+        try:
+            for remote_path, remote_sha in files_to_upload_to_s3.items():
+                fname = os.path.basename(remote_path)
+                local_path = os.path.join(tmpdir, fname)
+                s3_key = f"{S3_DIR}/{fname}"
 
-            # Download file from remote
-            ssh_manager_obj.download_remote_files(remote_path, local_path)
+                # Download file from remote
+                ssh_manager_obj.download_remote_files(remote_path, local_path)
 
-            # From local temp, upload it to S3
-            try:
-                self.s3_client.upload_file(local_path, S3_BUCKET_NAME, s3_key)
-            except botocore.exceptions.ClientError as exc:
-                upload_error_msg = f"Error uploading:{str(exc)}"
-                logging.error(upload_error_msg)
-                notify_homeassistant(upload_error_msg)
-                raise
+                # From local temp, upload it to S3
+                try:
+                    self.s3_client.upload_file(local_path, S3_BUCKET_NAME, s3_key)
+                except (
+                    botocore.exceptions.ClientError,
+                    botocore.exceptions.BotoCoreError,
+                    OSError,
+                ) as exc:
+                    upload_error_msg = f"Error uploading {remote_path}: {str(exc)}"
+                    logging.error(upload_error_msg)
+                    notify_homeassistant(upload_error_msg)
 
-            logging.info("Uploaded to s3://%s/%s", S3_BUCKET_NAME, s3_key)
+                logging.info("Uploaded to s3://%s/%s", S3_BUCKET_NAME, s3_key)
 
-            # Once uploaded, ensure the remote file's SHA256 hash matches
-            # the SHA256 hash of the file in S3
-            self.verify_sha256(s3_key, remote_sha)
+                # Once uploaded, ensure the remote file's SHA256 hash matches
+                # the SHA256 hash of the file in S3
+                self.verify_sha256(s3_key, remote_sha)
 
-            # Update upload history file content
-            upload_history_file[s3_key] = remote_sha
-
-        shutil.rmtree(tmpdir)  # wipe temp files
+                # Update upload history file content
+                upload_history_file[s3_key] = remote_sha
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)  # wipe temp files
 
         # Update/Create history file
         update_or_create_upload_history_file(upload_history_file)
